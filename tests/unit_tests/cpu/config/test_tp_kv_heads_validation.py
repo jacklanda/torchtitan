@@ -33,6 +33,7 @@ try:
         sys.modules["triton"] = MagicMock()
         sys.modules["triton.language"] = MagicMock()
 
+    from torchtitan.components.loss import CrossEntropyLoss
     from torchtitan.config import DebugConfig, TrainingConfig
     from torchtitan.config.parallelism import ParallelismConfig
     from torchtitan.config.validation import validate_model_training_config
@@ -65,6 +66,7 @@ def _validate(config: "Llama3Model.Config", tp: int) -> None:
         debug=DebugConfig(),
         activation_remat=None,
         max_num_documents=None,
+        loss=CrossEntropyLoss.Config(),
     )
 
 
