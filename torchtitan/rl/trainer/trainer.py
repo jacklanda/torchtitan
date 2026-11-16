@@ -29,6 +29,7 @@ from torchtitan.observability.logging import init_logger
 from torchtitan.observability.metrics import compute_training_performance_metrics
 from torchtitan.rl.controller.metrics import combine_microbatch_metrics
 from torchtitan.rl.model_state_dict_transport import (
+    ModelStateDictTransferMetadata,
     ModelStateDictTransport,
     TensorShard,
     TrainerSource,
@@ -443,7 +444,7 @@ class Trainer(Configurable):
         )
 
     @sl.log_trace_span("push_model_state_dict")
-    async def push_model_state_dict(self) -> None:
+    async def push_model_state_dict(self) -> ModelStateDictTransferMetadata:
         """Publish model weights for generators to pull.
 
         With TorchStore, the live GPU tensors are put directly, so the trainer
@@ -468,11 +469,17 @@ class Trainer(Configurable):
         frozen parameters from `generator.checkpointer`: for LoRA the base, so a push
         carries only the adapters (`lora_a`, `lora_b`) and the buffers.
 
-        With a ``ModelStateDictTransport``, the push instead stages the tensors in
-        its pinned staging buffer, which generators read directly; the same
-        ordering applies, and the next push overwrites the staging buffer.
+        With a ``ModelStateDictTransport``, the first push stages a full pinned
+        CPU baseline. Later pushes stage the current tensors and report which
+        transfer ranges changed; generators read those ranges directly
+        into their pinned prefetch tensors. The same ordering applies, and the
+        next push reuses the current-state staging tensor.
         Staging enqueues its copies on the push stream from this thread; only
         the wait for them is off the event loop.
+
+        Returns:
+            Small transfer metadata for the controller to forward unchanged to
+            generator prefetch endpoints.
         """
         transport = self._model_state_dict_transport
         if transport is not None:
@@ -482,13 +489,14 @@ class Trainer(Configurable):
             # Generators read the staging buffer outside stream order.
             if stream is not None:
                 await asyncio.to_thread(stream.synchronize)
-            return
+            return await asyncio.to_thread(transport.finish_stage)
         model_state_dict = self._trainable_model_state_dict()
         await asyncio.to_thread(
             self._put_model_state_dict,
             model_state_dict,
             self._preserve_dtype_keys(model_state_dict),
         )
+        return ModelStateDictTransferMetadata(())
 
     def _put_model_state_dict(
         self,

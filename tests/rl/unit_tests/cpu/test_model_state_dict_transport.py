@@ -58,9 +58,12 @@ class _FakeTransport:
     def __init__(self):
         self.url = str(next(self._urls)).encode()
         self.connected = set()
+        self.registered = []
+        self.reads = []
 
     def register_memory(self, tensor):
         assert tensor.numel() > 0 and tensor.is_contiguous()
+        self.registered.append(tensor)
         return _FakeMemory(tensor, self.url)
 
     def bind(self):
@@ -72,6 +75,7 @@ class _FakeTransport:
     def read(self, local, remote, *, async_op):
         assert remote.url in self.connected
         assert local.shape == remote.data.shape
+        self.reads.append((local, remote))
         local.copy_(remote.data)
 
 
@@ -134,7 +138,7 @@ def _transfer(
         generator_sds.append(sd)
     rank_layouts = [m.shard_layout(sd) for sd in generator_sds]
 
-    sources, trainers = [], []
+    sources, trainer_metadata, trainers = [], [], []
     for shards in trainer_shards:
         sd = {key: local for key, (local, _) in shards.items()}
         for key, (local, box) in shards.items():
@@ -149,6 +153,7 @@ def _transfer(
             )
         )
         trainer.stage(sd)
+        trainer_metadata.append(trainer.finish_stage())
         trainers.append(trainer)
 
     loaded_sds = []
@@ -157,7 +162,7 @@ def _transfer(
         generator.connect_generator(
             sd, sources=sources, rank=rank, generator_index=generator_index
         )
-        asyncio.run(generator.read())
+        asyncio.run(generator.read(tuple(trainer_metadata), full=True))
         loaded = {key: torch.full_like(tensor, -1) for key, tensor in sd.items()}
         generator.copy_prefetched_(loaded)
         loaded_sds.append(loaded)
@@ -307,6 +312,119 @@ def test_no_reads(monkeypatch):
     assert out["w"].shape == (0, 3)
 
 
+def test_full_sync_is_default(monkeypatch):
+    config = ModelStateDictTransport.Config(backend="nixl", read_timeout_s=5.0)
+    monkeypatch.setattr(m, "new_transport", lambda backend: _FakeTransport())
+    monkeypatch.setattr(m, "wait_all", _wait_all)
+
+    initial = {"w": torch.arange(8, dtype=torch.float32)}
+    prefetched = {"w": torch.zeros_like(initial["w"])}
+    layouts = [m.shard_layout(prefetched)]
+    trainer = ModelStateDictTransport(config)
+    source = trainer.register_trainer_source(
+        initial,
+        generator_rank_layouts=layouts,
+        transfer_dtype=None,
+        preserve_dtype_keys=frozenset(),
+    )
+    assert len(trainer._transport.registered) == 1
+
+    trainer.stage(initial)
+    metadata = trainer.finish_stage()
+    generator = ModelStateDictTransport(config)
+    generator.connect_generator(prefetched, sources=[source], rank=0, generator_index=0)
+    asyncio.run(generator.read((metadata,), full=True))
+
+    target = {"w": initial["w"] + 10}
+    trainer.stage(target)
+    metadata = trainer.finish_stage()
+    asyncio.run(generator.read((metadata,), full=False))
+    assert len(generator._transport.reads) == 2
+    torch.testing.assert_close(prefetched["w"], target["w"], rtol=0, atol=0)
+
+
+def test_delta_reads_only_changed_transfer_ranges(monkeypatch):
+    config = ModelStateDictTransport.Config(
+        backend="nixl", sync_mode="delta", read_timeout_s=5.0
+    )
+    monkeypatch.setattr(m, "new_transport", lambda backend: _FakeTransport())
+    waited_read_counts = []
+
+    async def wait_all(works, *, timeout):
+        assert timeout == config.read_timeout_s
+        waited_read_counts.append(len(works))
+
+    monkeypatch.setattr(m, "wait_all", wait_all)
+
+    initial = {
+        "unchanged": torch.arange(128, dtype=torch.bfloat16),
+        "changed": torch.arange(128, dtype=torch.bfloat16) + 200,
+        "many_changes": torch.arange(128, dtype=torch.bfloat16) + 400,
+    }
+    prefetched = {key: torch.zeros_like(value) for key, value in initial.items()}
+    layouts = [m.shard_layout(prefetched)]
+
+    trainer = ModelStateDictTransport(config)
+    source = trainer.register_trainer_source(
+        initial,
+        generator_rank_layouts=layouts,
+        transfer_dtype=None,
+        preserve_dtype_keys=frozenset(),
+    )
+    assert len(trainer._transport.registered) == 1
+    trainer.stage(initial)
+    metadata = trainer.finish_stage()
+
+    generator = ModelStateDictTransport(config)
+    generator.connect_generator(prefetched, sources=[source], rank=0, generator_index=0)
+    assert len(generator._transport.registered) == len(prefetched)
+    asyncio.run(generator.read((metadata,), full=True))
+    assert generator._reads is not None
+    ranges_by_key = {}
+    for read, *_ in generator._reads:
+        ranges_by_key.setdefault(read.key, []).append(
+            m.TransferRange(read.byte_offset, read.nbytes)
+        )
+    num_ranges = sum(map(len, ranges_by_key.values()))
+    assert len(generator._transport.reads) == num_ranges
+    assert waited_read_counts == [num_ranges]
+    for key in initial:
+        torch.testing.assert_close(prefetched[key], initial[key], rtol=0, atol=0)
+
+    target = {key: value.clone() for key, value in initial.items()}
+    target["changed"][3] += 1
+    target["many_changes"][:125].neg_()
+    trainer.stage(target)
+    metadata = trainer.finish_stage()
+
+    changed_ranges = set(metadata.changed_ranges)
+    changed_by_key = {
+        key: [transfer_range in changed_ranges for transfer_range in ranges]
+        for key, ranges in ranges_by_key.items()
+    }
+    assert changed_by_key == {
+        "unchanged": [False],
+        "changed": [True],
+        "many_changes": [True],
+    }
+
+    asyncio.run(generator.read((metadata,), full=False))
+    assert len(generator._transport.reads) == num_ranges + 2
+    assert waited_read_counts == [num_ranges, 2]
+    for key in target:
+        torch.testing.assert_close(prefetched[key], target[key], rtol=0, atol=0)
+
+    # The trainer baseline and generator prefetch state both advance after a
+    # delta, so the following push is relative to `target`.
+    next_target = {key: value.clone() for key, value in target.items()}
+    next_target["changed"][17] += 2
+    trainer.stage(next_target)
+    metadata = trainer.finish_stage()
+    asyncio.run(generator.read((metadata,), full=False))
+    for key in next_target:
+        torch.testing.assert_close(prefetched[key], next_target[key], rtol=0, atol=0)
+
+
 def test_shared_rank_layouts():
     a = m.TensorShard((0,), (2,), torch.float32)
     b = m.TensorShard((2,), (2,), torch.float32)
@@ -426,8 +544,11 @@ class TestStageDTensors(DTensorTestBase):
                     preserve_dtype_keys=frozenset(),
                 )
                 trainer.stage(sd)
+                metadata = trainer.finish_stage()
                 sources = [None] * self.world_size
                 dist.all_gather_object(sources, source)
+                metadata_by_source = [None] * self.world_size
+                dist.all_gather_object(metadata_by_source, metadata)
 
                 for rank, layout in enumerate(rank_layouts):
                     generator_sd = {}
@@ -438,7 +559,7 @@ class TestStageDTensors(DTensorTestBase):
                     generator.connect_generator(
                         generator_sd, sources=sources, rank=rank, generator_index=0
                     )
-                    asyncio.run(generator.read())
+                    asyncio.run(generator.read(tuple(metadata_by_source), full=True))
                     self.assertEqual(set(generator._packed), packed)
                     loaded = {key: torch.zeros(s.shape) for key, s in layout.items()}
                     generator.copy_prefetched_(loaded)
