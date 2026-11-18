@@ -20,6 +20,7 @@ if TYPE_CHECKING:
         paged_chunk_gdn,
         recurrent_gdn,
         recurrent_gdn_decode,
+        StateCheckpoints,
     )
     from attn_gym.linear._delta_rule.gate import _FusedGate, gate_transform
     from attn_gym.linear.context_parallel import (
@@ -84,6 +85,7 @@ __all__ = [
     "recurrent_gdn",
     "recurrent_gdn_decode",
     "recurrent_kda_decode",
+    "StateCheckpoints",
     "is_missing_kernel",
     "require_attn_gym",
 ]
@@ -121,6 +123,7 @@ _EXPORTS = {
     "recurrent_gdn": "attn_gym.linear",
     "recurrent_gdn_decode": "attn_gym.linear",
     "recurrent_kda_decode": "attn_gym.linear.kda",
+    "StateCheckpoints": "attn_gym.linear",
 }
 
 

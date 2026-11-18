@@ -21,6 +21,10 @@ from torchtitan.models.common.attn_gym import (
     paged_chunk_gdn,
     recurrent_gdn,
 )
+from torchtitan.rl.generator.attention.state_checkpoints import (
+    copy_checkpoints,
+    periodic_checkpoints,
+)
 
 
 def paged_gdn(
@@ -38,6 +42,8 @@ def paged_gdn(
     head_k_dim: int,
     num_v_heads: int,
     head_v_dim: int,
+    checkpoint_slots: torch.Tensor | None = None,
+    checkpoint_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the recurrence of each ``cu_seqlens`` interval from its slot in
     ``state_indices``, advancing ``state_pool_NHVK`` in place.
@@ -52,6 +58,9 @@ def paged_gdn(
         has_initial_state: Per interval, whether its slot holds a state to resume;
             False starts from zero.
         num_k_heads, num_v_heads: Rank-local head counts.
+        checkpoint_slots, checkpoint_lens: Per interval, a slot that also receives the
+            state after the interval's first ``checkpoint_lens`` tokens (non-positive slot:
+            none; lengths a positive multiple of 64), for an engine's prefix cache.
 
     Returns:
         ``(T, H, V)``.
@@ -83,6 +92,11 @@ def paged_gdn(
     query = l2norm(query, cu_seqlens=cu_seqlens)
     key = l2norm(key, cu_seqlens=cu_seqlens)
 
+    checkpoints = (
+        None
+        if checkpoint_slots is None
+        else periodic_checkpoints(cu_seqlens, state_pool_NHVK, num_tokens=num_tokens)
+    )
     if is_in_batch_invariant_mode():
         recurrent_output, _ = recurrent_gdn(
             query,
@@ -98,6 +112,7 @@ def paged_gdn(
             # Triton autotuning breaks batch invariance, and the scan otherwise picks
             # its arithmetic from the batch shape.
             kernel_options={"batch_invariant": True, "autotune": False},
+            state_checkpoints=checkpoints,
         )
     else:
         recurrent_output = paged_chunk_gdn(
@@ -112,5 +127,13 @@ def paged_gdn(
             has_initial_state=has_initial_state,
             scale=head_k_dim**-0.5,
             kernel_options=chunk_kernel_options(query),
+            state_checkpoints=checkpoints,
+        )
+    if checkpoints is not None:
+        copy_checkpoints(
+            checkpoints,
+            state_pool_NHVK,
+            checkpoint_slots_S=checkpoint_slots,
+            checkpoint_lens_S=checkpoint_lens,
         )
     return recurrent_output[0]

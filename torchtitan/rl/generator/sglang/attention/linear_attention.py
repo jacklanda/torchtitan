@@ -127,6 +127,47 @@ class TorchTitanLinearAttnBackend(MambaAttnBackendBase):
     which the kernels skip. Speculative decoding is not supported.
     """
 
+    def __init__(self, model_runner) -> None:
+        super().__init__(model_runner)
+        # SGLang's extend tracking reads the conv window length (W - 1) as the last
+        # dim of conv_states_shape; the pool keeps [W - 1, C] per slot, as SGLang's KDA
+        # backend does, which exposes the transposed shape too.
+        self.conv_states_shape = (
+            self.state_pool.mamba_cache.conv[0].transpose(-1, -2).shape
+        )
+
+    def track_extend_states(
+        self, forward_batch, mixed_qkv_TC: torch.Tensor, conv_state: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Snapshot each tracked request's state at the position SGLang's
+        ``extra_buffer`` prefix cache tracks in this extend, the last
+        ``mamba_cache_chunk_size`` boundary of its new tokens, into its track slot.
+
+        Copies the conv history there (the inputs before that position) and returns
+        the recurrence's checkpoint arguments (see ``paged_gdn`` and ``paged_kda``),
+        which store the recurrent state there. Empty when SGLang tracks nothing in
+        this step.
+        """
+        metadata = self.forward_metadata
+        if not metadata.has_mamba_track_mask:
+            return {}
+        track_mask = forward_batch.mamba_track_mask
+        track_indices = metadata.mamba_track_indices
+        tracked_rows = metadata.mamba_track_mask_indices
+        if tracked_rows is None:
+            tracked_rows = track_mask.nonzero(as_tuple=True)[0]
+        # The conv history is the [W - 1, C] inputs before the position.
+        conv_state[track_indices[tracked_rows]] = mixed_qkv_TC[
+            metadata.track_conv_indices
+        ].to(conv_state.dtype)
+        return {
+            "checkpoint_slots": torch.where(track_mask, track_indices, -1),
+            # Untracked rows' lengths are garbage; their checkpoint index is -1.
+            "checkpoint_lens": torch.where(
+                track_mask, forward_batch.mamba_track_aligned_lens(), 0
+            ).to(torch.int32),
+        }
+
     def convolve_extend(
         self,
         forward_batch,
