@@ -21,7 +21,7 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.fa_utils import reshape_and_cache_flash
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import CircularBufferSpec, FullAttentionSpec
 
 from torchtitan.models.common.attn_gym import paged_sparse_decode, PagedKV
 
@@ -237,3 +237,21 @@ class PagedCache(torch.nn.Module, AttentionLayerBase):
             < metadata.query_start_loc[-1]
         )
         return output_THK.masked_fill(~valid_T[:, None, None], 0)
+
+
+class PagedRingCache(PagedCache):
+    """One state ring per request, with at least 16 slots, managed by vLLM."""
+
+    def get_kv_cache_spec(self, vllm_config):
+        return CircularBufferSpec(
+            block_size=16,
+            num_kv_heads=self.num_heads,
+            head_size=self.head_dim,
+            dtype=self.dtype,
+        )
+
+    def gather(self, cache_PNHK, request_T, positions_T, metadata):
+        return cache_PNHK[
+            metadata.block_table[request_T, 0].long(),
+            positions_T % cache_PNHK.shape[1],
+        ]

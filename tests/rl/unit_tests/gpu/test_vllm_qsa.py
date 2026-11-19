@@ -6,17 +6,21 @@
 
 """Cache addressing, causal tails and request isolation for Flash-Next generation."""
 
+from dataclasses import fields, replace
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 pytest.importorskip(
-    "attn_gym.sparse.paged_decode",
-    reason="Paged QSA tests require Attention Gym paged sparse attention",
+    "attn_gym.sparse.indexer.paged",
+    reason="Paged QSA tests require the Attention Gym decode indexer",
 )
 
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.models.qwen3_8_flash_next import build_model_config
 from torchtitan.rl.generator.vllm.attention import qsa
+from torchtitan.rl.generator.vllm.attention.qsa_model import VLLMQSAIndexer
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="Paged QSA requires a GPU"
@@ -104,6 +108,134 @@ def test_paged_qsa_mixed_queries_tail_and_padding(make_cache):
                 output[index].float(), expected, atol=1e-2, rtol=1e-2
             )
     assert torch.count_nonzero(output[11:]) == 0
+
+
+def _reference_paged_indexer(
+    query,
+    key_cache,
+    weights,
+    block_table,
+    cu_seqlens_q,
+    seqused_k,
+    *,
+    topk,
+    compress_ratio=4,
+):
+    """Test-only implementation of the agreed Attention Gym selection contract."""
+    result = torch.full(
+        (query.shape[0], topk), -1, device=query.device, dtype=torch.int32
+    )
+    for request in range(seqused_k.numel()):
+        start, end = map(int, cu_seqlens_q[request : request + 2])
+        for row in range(start, end):
+            count = (
+                int(seqused_k[request]) - (end - start) + row - start + 1
+            ) // compress_ratio
+            blocks = torch.arange(count, device=query.device)
+            keys = key_cache[
+                block_table[request, blocks // key_cache.shape[1]].long(),
+                blocks % key_cache.shape[1],
+            ]
+            scores = (
+                torch.einsum("hd,bd->hb", query[row].float(), keys.float()).relu()
+                * weights[row, :, None]
+            ).sum(0)
+            selected = scores.argsort(descending=True, stable=True)[:topk].sort().values
+            result[row, : selected.numel()] = selected.int()
+    return result
+
+
+def test_indexer_completed_blocks_across_prefill_and_decode(make_cache):
+    """Pooling straddling chunks must equal norm(mean(raw keys)) then block-start RoPE."""
+    make_cache("fixture", 32)
+    torch.manual_seed(42)
+    config = (
+        build_model_config("debugmodel", seq_len=64, parallelism=ParallelismConfig())
+        .layers[3]
+        .attention.indexer
+    )
+    config.token_budget = 8
+    indexer = (
+        VLLMQSAIndexer.Config(
+            **{field.name: getattr(config, field.name) for field in fields(config)},
+            layer_idx=3,
+        )
+        .build()
+        .cuda()
+    )
+    indexer.init_states()
+    for parameter in indexer.parameters():
+        parameter.data = parameter.data.bfloat16()
+    indexer.requires_grad_(False)
+    indexer.cache.bind_kv_cache(
+        torch.zeros(3, 1, 4, 2 * config.head_dim, device="cuda", dtype=torch.bfloat16)
+    )
+    indexer.raw_cache.bind_kv_cache(
+        torch.randn(2, 1, 32, 2 * config.head_dim, device="cuda", dtype=torch.bfloat16)
+    )
+    context = qsa.get_forward_context().attn_metadata
+    raw_keys = []
+    offset = 0
+    block_table = torch.tensor([[2, 1]], device="cuda", dtype=torch.int32)
+    for length in (3, 1, 9, 6, 1):
+        positions = torch.arange(offset, offset + length, device="cuda")
+        x = torch.randn(
+            length,
+            config.index_qk_proj.in_features,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        raw_keys.append(indexer.index_qk_proj(x)[:, -config.head_dim :])
+        metadata = qsa.QSAPagedMetadata(
+            block_table=block_table,
+            slot_mapping=(block_table[0, positions // 16].long() * 16 + positions % 16),
+            query_start_loc=torch.tensor([0, length], device="cuda", dtype=torch.int32),
+            seq_lens=torch.tensor([offset + length], device="cuda", dtype=torch.int32),
+            max_query_len=length,
+        )
+        context[indexer.cache.prefix] = metadata
+        context[indexer.raw_cache.prefix] = replace(
+            metadata, block_table=torch.ones(1, 1, device="cuda", dtype=torch.int32)
+        )
+        selected, _ = indexer(x, positions=positions, document_positions_T=positions)
+        offset += length
+        count = offset // 4
+        if count:
+            pooled = (
+                torch.cat(raw_keys)[: count * 4]
+                .reshape(count, 4, -1)
+                .float()
+                .mean(1)
+                .bfloat16()
+            )
+            expected = indexer._rotate(
+                indexer.k_layernorm(pooled)[:, None],
+                torch.arange(count, device="cuda") * 4,
+            )[:, 0]
+            cache, _ = indexer.cache.views()
+            blocks = torch.arange(count, device="cuda")
+            actual = cache[block_table[0, blocks // 4].long(), blocks % 4, 0]
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        query = indexer._rotate(
+            indexer.q_layernorm(
+                indexer.index_qk_proj(x)[:, : -config.head_dim].unflatten(
+                    -1, (indexer.num_heads, config.head_dim)
+                )
+            ),
+            positions,
+        )
+        expected_selection = _reference_paged_indexer(
+            query,
+            indexer.cache.views()[0][:, :, 0],
+            query.new_ones(query.shape[:2]),
+            block_table,
+            metadata.query_start_loc,
+            metadata.seq_lens,
+            topk=indexer.block_topk,
+        )
+        torch.testing.assert_close(selected, expected_selection, atol=0, rtol=0)
+        for row, position in enumerate(positions.tolist()):
+            assert ((selected[row] < (position + 1) // 4) | (selected[row] == -1)).all()
 
 
 def test_decode_graph_refreshes_request_layout(make_cache):
